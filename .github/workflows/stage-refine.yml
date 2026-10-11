@@ -131,8 +131,9 @@ jobs:
         (github.event.action == 'labeled' && github.event.label.name == inputs.namespace)))
     runs-on: ubuntu-latest
     # Actions expressions cannot add, so "step timeout + 10" cannot be written
-    # here. The ceiling is a literal; the first step asserts the rule.
-    timeout-minutes: 30
+    # here. The ceiling is a literal; the first step asserts the rule, for the
+    # deeper of the two budgets.
+    timeout-minutes: 45
 
     steps:
       # Two identities, chosen by whether the App's id was passed.
@@ -241,9 +242,16 @@ jobs:
           # turns and these minutes, and a run that needs more is a task that
           # was too big. The job ceiling is a literal (Actions expressions
           # cannot add) and step + 10 must fit inside it, asserted below.
+          # An effort of xhigh or max thinks longer on every turn and reads
+          # more, so it plans on the deeper budget, chosen in the ask step,
+          # which settles the effort: facts-a-day-app#39 on Opus 5.5 at max
+          # timed out at 20 minutes, then finished a plan in 65 turns
+          # (2026-10-11), where Opus 5 at max had planned in 53 and 7.
           MAX_TURNS: "60"
           TIMEOUT: "20"
-          CEILING: "30"
+          DEEP_MAX_TURNS: "90"
+          DEEP_TIMEOUT: "35"
+          CEILING: "45"
           ISSUE_FOR_ERRORS: ${{ github.event.issue.number || github.event.inputs.issue_number }}
           IN_MAINTAINERS: ${{ inputs.maintainers }}
           IN_MODEL: ${{ inputs.model }}
@@ -322,6 +330,7 @@ jobs:
           esac
           # Not the tenant's doing: this is the rule the job ceiling above encodes.
           [ $((TIMEOUT + 10)) -le "$CEILING" ] || { echo "::error::stage bug: a step timeout of $TIMEOUT + 10 does not fit the $CEILING-minute job ceiling"; exit 1; }
+          [ $((DEEP_TIMEOUT + 10)) -le "$CEILING" ] || { echo "::error::stage bug: a step timeout of $DEEP_TIMEOUT + 10 does not fit the $CEILING-minute job ceiling"; exit 1; }
 
           {
             echo "maintainers=$MAINTAINERS"
@@ -331,6 +340,8 @@ jobs:
             echo "effort=$EFFORT"
             echo "max_turns=$MAX_TURNS"
             echo "timeout_min=$TIMEOUT"
+            echo "deep_max_turns=$DEEP_MAX_TURNS"
+            echo "deep_timeout_min=$DEEP_TIMEOUT"
             echo "advance_build=$ADVANCE"
             echo "gates<<AISWEC_EOF"; printf '%s\n' "$GATES"; echo "AISWEC_EOF"
           } >> "$GITHUB_OUTPUT"
@@ -424,6 +435,10 @@ jobs:
           PROVIDER: ${{ steps.cfg.outputs.provider }}
           MODEL: ${{ steps.cfg.outputs.model }}
           EFFORT: ${{ steps.cfg.outputs.effort }}
+          MAX_TURNS: ${{ steps.cfg.outputs.max_turns }}
+          TIMEOUT: ${{ steps.cfg.outputs.timeout_min }}
+          DEEP_MAX_TURNS: ${{ steps.cfg.outputs.deep_max_turns }}
+          DEEP_TIMEOUT: ${{ steps.cfg.outputs.deep_timeout_min }}
           HAS_CLAUDE: ${{ secrets.claude_code_oauth_token != '' }}
           HAS_OPENROUTER: ${{ secrets.openrouter_api_key != '' }}
         run: |
@@ -468,8 +483,14 @@ jobs:
                 exit 1
               fi
             fi
+            # The budget follows the effort, which is settled only here (the cfg step's literals).
+            case "$EFFORT_OUT" in
+              xhigh|max) TURNS_OUT="$DEEP_MAX_TURNS"; TIMEOUT_OUT="$DEEP_TIMEOUT" ;;
+              *) TURNS_OUT="$MAX_TURNS"; TIMEOUT_OUT="$TIMEOUT" ;;
+            esac
             { echo "provider=$PROVIDER_OUT"; echo "model=$MODEL_OUT"; echo "effort=$EFFORT_OUT"; echo "window=$WINDOW"; echo "vision=$VISION"; } >> "$GITHUB_OUTPUT"
-            echo "settings: provider=$PROVIDER_OUT model=$MODEL_OUT effort=${EFFORT_OUT:-default}${WINDOW:+ window=$WINDOW}${1:+ ($1)}"
+            { echo "max_turns=$TURNS_OUT"; echo "timeout_min=$TIMEOUT_OUT"; } >> "$GITHUB_OUTPUT"
+            echo "settings: provider=$PROVIDER_OUT model=$MODEL_OUT effort=${EFFORT_OUT:-default} turns=$TURNS_OUT timeout=${TIMEOUT_OUT}m${WINDOW:+ window=$WINDOW}${1:+ ($1)}"
             exit 0
           }
 
@@ -796,7 +817,7 @@ jobs:
         if: steps.ctx.outputs.skip != 'true'
         id: claude
         continue-on-error: true
-        timeout-minutes: ${{ fromJSON(steps.cfg.outputs.timeout_min) }}
+        timeout-minutes: ${{ fromJSON(steps.ask.outputs.timeout_min || steps.cfg.outputs.timeout_min) }}
         uses: anthropics/claude-code-action@v1
         with:
           # One of the two, never both: with CLAUDE_CODE_OAUTH_TOKEN set the
@@ -1227,10 +1248,41 @@ jobs:
           # memory of it; the prompt's "Where the repository stands" says which
           # pages may be opened, and a URL the issue offers is never one.
           claude_args: |
-            --max-turns ${{ steps.cfg.outputs.max_turns }}
+            --max-turns ${{ steps.ask.outputs.max_turns || steps.cfg.outputs.max_turns }}
             --model ${{ steps.ask.outputs.model }}
             ${{ steps.ask.outputs.effort && format('--effort {0}', steps.ask.outputs.effort) || '' }}
             --allowedTools "Read,Glob,Grep,Write,WebSearch,WebFetch,Bash(gh issue view:*)"
+
+      # Claude Code does not stop at --max-turns: it can finish past it and report success, and
+      # claude-code-action then fails the step (its run-claude-sdk.ts, since 2026-08-07). By then
+      # the cap saved nothing, and failing threw away finished work: facts-a-day-app#39's plan,
+      # written after 65 turns of 60 (2026-10-11). So a result the transcript calls a success is
+      # the engine's success here, past the cap, with a warning; every other failure stays one.
+      # Every later step reads the engine's outcome from this step, never from steps.claude.
+      - name: Read the engine's verdict
+        id: verdict
+        if: always() && steps.ctx.outputs.skip == 'false'
+        env:
+          OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          MAX_TURNS: ${{ steps.ask.outputs.max_turns || steps.cfg.outputs.max_turns }}
+        run: |
+          set -o pipefail
+          VERDICT="${OUTCOME:-skipped}"
+          if [ "$VERDICT" = failure ] && [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            TURNS=$(jq -r '[.[] | select(.type == "result")] | last // {} | select(.subtype == "success" and (.is_error | not)) | .num_turns // empty' "$EXECUTION_FILE" 2>/dev/null) || TURNS=""
+            case "$TURNS" in
+              ''|*[!0-9]*) ;;
+              *)
+                if [ "$TURNS" -gt "$MAX_TURNS" ]; then
+                  echo "::warning::the engine finished after $TURNS turns, past the $MAX_TURNS it was given; its work is kept"
+                  VERDICT=success
+                fi
+                ;;
+            esac
+          fi
+          echo "outcome=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "the engine's outcome: $VERDICT"
 
       # Nothing the engine wrote may carry a credential this run holds, or a string shaped like one
       # (2026-10-08). The engine's process holds the engine key and the App's token, and its
@@ -1294,7 +1346,7 @@ jobs:
           STAGE: refine
           RUN_ID: ${{ github.run_id }}
           JOB_STATUS: ${{ job.status }}
-          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.verdict.outputs.outcome }}
           PROVIDER: ${{ steps.ask.outputs.provider }}
           EFFORT: ${{ steps.ask.outputs.effort }}
           MODEL: ${{ steps.ask.outputs.model }}
@@ -1387,7 +1439,7 @@ jobs:
           NS: ${{ inputs.namespace }}
           ADVANCE: ${{ steps.cfg.outputs.advance_build }}
           BUILD_WORKFLOW: ${{ inputs.build_workflow }}
-          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.verdict.outputs.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ACK_ID: ${{ steps.ack.outputs.ack_id }}
           RUN_LINE: ${{ steps.runline.outputs.line }}
@@ -1504,7 +1556,7 @@ jobs:
 
             # A missing heading is a section Suite cannot show. Worth saying in the
             # log, never worth withholding a plan for.
-            for HEADING in "## Implementation Spec" "### At a glance" "### Problem" "### Proposed approach" "### Affected files" "### Acceptance criteria" "### Test plan"; do
+            for HEADING in "## Implementation Spec" "### At a glance" "### Problem" "### Proposed approach" "### Affected files" "### Acceptance criteria"; do
               grep -qxF "$HEADING" /tmp/aiswec-spec.md \
                 || echo "::warning::the spec is missing the heading \"$HEADING\"; Suite will render that part as plain markdown"
             done

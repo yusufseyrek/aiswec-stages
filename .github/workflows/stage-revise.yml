@@ -1270,6 +1270,37 @@ jobs:
             ${{ steps.ask.outputs.effort && format('--effort {0}', steps.ask.outputs.effort) || '' }}
             --allowedTools "${{ inputs.allowed_tools || 'Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(bun install:*),Bash(bun run:*),Bash(bun test:*),Bash(bun tsc:*),Bash(bunx jest:*),Bash(bunx tsc:*),Bash(bunx eslint:*),Bash(npm run:*),Bash(npx jest:*),Bash(npx tsc:*),Bash(npx eslint:*),Bash(gh pr view:*),Bash(gh pr ready:*),Bash(gh issue view:*),Bash(ls:*),Bash(cat:*)' }}"
 
+      # Claude Code does not stop at --max-turns: it can finish past it and report success, and
+      # claude-code-action then fails the step (its run-claude-sdk.ts, since 2026-08-07). By then
+      # the cap saved nothing, and failing threw away finished work: facts-a-day-app#39's plan,
+      # written after 65 turns of 60 (2026-10-11). So a result the transcript calls a success is
+      # the engine's success here, past the cap, with a warning; every other failure stays one.
+      # Every later step reads the engine's outcome from this step, never from steps.claude.
+      - name: Read the engine's verdict
+        id: verdict
+        if: always() && steps.ctx.outputs.skip == 'false'
+        env:
+          OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          MAX_TURNS: ${{ steps.cfg.outputs.max_turns }}
+        run: |
+          set -o pipefail
+          VERDICT="${OUTCOME:-skipped}"
+          if [ "$VERDICT" = failure ] && [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            TURNS=$(jq -r '[.[] | select(.type == "result")] | last // {} | select(.subtype == "success" and (.is_error | not)) | .num_turns // empty' "$EXECUTION_FILE" 2>/dev/null) || TURNS=""
+            case "$TURNS" in
+              ''|*[!0-9]*) ;;
+              *)
+                if [ "$TURNS" -gt "$MAX_TURNS" ]; then
+                  echo "::warning::the engine finished after $TURNS turns, past the $MAX_TURNS it was given; its work is kept"
+                  VERDICT=success
+                fi
+                ;;
+            esac
+          fi
+          echo "outcome=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "the engine's outcome: $VERDICT"
+
       # Nothing the engine wrote may carry a credential this run holds, or a string shaped like one
       # (2026-10-08). The engine's process holds the engine key and the App's token, and its
       # instructions come from text anyone may have written, so what it wrote is read before it
@@ -1351,7 +1382,7 @@ jobs:
       # build command, and the web status stays off then.
       - name: Export preview
         id: preview
-        if: always() && steps.ctx.outputs.skip == 'false' && steps.claude.outcome == 'success' && (steps.cfg.outputs.preview_command != '' || steps.cfg.outputs.preview_phone == 'eas')
+        if: always() && steps.ctx.outputs.skip == 'false' && steps.verdict.outputs.outcome == 'success' && (steps.cfg.outputs.preview_command != '' || steps.cfg.outputs.preview_phone == 'eas')
         timeout-minutes: 10
         continue-on-error: true
         env:
@@ -1789,7 +1820,7 @@ jobs:
           STAGE: revise
           RUN_ID: ${{ github.run_id }}
           JOB_STATUS: ${{ job.status }}
-          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.verdict.outputs.outcome }}
           PROVIDER: ${{ steps.ask.outputs.provider }}
           EFFORT: ${{ steps.ask.outputs.effort }}
           MODEL: ${{ steps.ask.outputs.model }}
@@ -1929,7 +1960,7 @@ jobs:
           NS: ${{ inputs.namespace }}
           BEFORE_SHA: ${{ steps.ctx.outputs.before_sha }}
           ACK_ID: ${{ steps.ack.outputs.ack_id }}
-          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.verdict.outputs.outcome }}
           RUN_LINE: ${{ steps.runline.outputs.line }}
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
